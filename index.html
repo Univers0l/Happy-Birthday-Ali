@@ -1,0 +1,1276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0a0815">
+<title>Happy Birthday!</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    background: radial-gradient(ellipse at 50% 45%, #1e1738 0%, #0a0815 72%);
+  }
+  body {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #stage { position: relative; }
+  canvas { display: block; }
+  #stage .glow { position: absolute; left: 0; top: 0; pointer-events: none; }
+  #g1 { filter: blur(2.5px) brightness(1.5) saturate(1.2); opacity: 0.75; }
+  #g2 { filter: blur(11px) brightness(1.9) saturate(1.4); opacity: 0.6; }
+  #c { position: relative; }
+  #hint {
+    position: fixed;
+    left: 0; right: 0;
+    bottom: max(22px, env(safe-area-inset-bottom));
+    text-align: center;
+    color: #c8b8f0;
+    font: 600 16px ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: 0.08em;
+    opacity: 0;
+    transition: opacity 0.8s;
+    pointer-events: none;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { transform: scale(1.06); filter: brightness(1.3); } }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="g2" class="glow"></canvas><canvas id="g1" class="glow"></canvas><canvas id="c"></canvas></div>
+<div id="hint">tap the gift to open</div>
+
+<script>
+/* =====================================================================
+   3D ASCII BIRTHDAY BOUQUET
+   Every flower is built from parametric surfaces, rotated in 3D,
+   perspective-projected onto a character grid with a z-buffer, and
+   shaded by surface normal -> ASCII luminance ramp (".,-~:;=!*#$@").
+
+   Glow, trails, directional outlines, star flares, white-hot blooms,
+   ribbon shine, dew glints and the twinkling end star are effects inspired
+   by "ROSE BOUQUET IN ASCII" by @dwcminh.ascii (re-implemented here).
+
+   Put her name below, OR add ?name=Her to the end of the link.
+   ===================================================================== */
+const DEFAULT_NAME = "Ali";
+
+const NAME = new URLSearchParams(location.search).get("name") || DEFAULT_NAME;
+const MESSAGE = NAME ? `Happy Birthday, ${NAME}!` : "Happy Birthday!";
+
+// ---------- timing (seconds) ----------
+const STAGGER = 0.17;   // gap between each stem starting
+const GROW    = 1.3;    // stem growth time
+const BLOOM   = 3.0;    // bud -> full bloom time
+const ROCK    = 0.5;    // how far the bouquet rocks left/right (rad)
+const CAM_D   = 4.5;    // camera distance (perspective strength)
+
+// ---------- shading ----------
+const RAMP = ".,-~:;=!*#$@";
+const LV = RAMP.length;
+const [LX, LY, LZ] = norm(-0.4, 0.6, 0.7);       // light direction (view space)
+const GA = Math.PI * (3 - Math.sqrt(5));            // golden angle ~137.5 deg
+
+// materials: [hue, saturation, darkest lightness, brightest lightness]
+const M = { stem:0, leaf:1, sepal:2, red:3, pink:4, tulipPink:5, tulipYellow:6, white:7,
+            yellow:8, sunPetal:9, sunCenter:10, lilyWhite:11, lilyPink:12, stamen:13,
+            lavender:14, paper:15, ribbon:16, breath:17, box:18, boxDark:19, gold:20, blue:21, flash:22 };
+const MATS = [
+  [125, 45, 10, 48], [105, 55, 12, 54], [115, 50, 12, 45], [350, 88, 14, 62],
+  [338, 82, 26, 80], [328, 85, 28, 78], [48, 95, 28, 70],  [230, 25, 38, 97],
+  [45, 95, 30, 62],  [44, 98, 28, 66],  [22, 65, 8, 32],   [330, 35, 45, 97],
+  [335, 78, 32, 72], [22, 95, 35, 62],  [265, 62, 30, 78], [345, 50, 32, 90],
+  [345, 90, 22, 60], [250, 20, 55, 98],
+  [356, 85, 14, 56], [352, 80, 9, 40], [47, 100, 36, 76], [205, 85, 40, 74],
+  [50, 100, 62, 92],
+];
+const PAL = MATS.map(([h, s, l0, l1]) => (l0 = Math.min(l0 + 8, 60), l1 = Math.min(l1 + 5, 97),
+  Array.from({ length: LV }, (_, i) => `hsl(${h},${s}%,${(l0 + (l1 - l0) * i / (LV - 1)).toFixed(1)}%)`)));
+
+// ---------- small math helpers ----------
+function norm(x, y, z) { const l = Math.hypot(x, y, z) || 1; return [x / l, y / l, z / l]; }
+function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+const clamp01 = x => x < 0 ? 0 : x > 1 ? 1 : x;
+const smooth = x => { x = clamp01(x); return x * x * (3 - 2 * x); };
+const easeOut = x => 1 - Math.pow(1 - clamp01(x), 3);
+
+// ---------- character grid + z-buffer ----------
+const cvs = document.getElementById("c");
+const ctx = cvs.getContext("2d");
+const hint = document.getElementById("hint");
+const glows = [{ el: document.getElementById("g1"), scale: 0.75 }, { el: document.getElementById("g2"), scale: 0.4 }];
+glows.forEach(g => (g.ctx = g.el.getContext("2d")));
+let GLOW_ON = true;
+const TRAIL = 0.34;          // how much of the previous frame lingers (fading trails)
+const FONT = 'ui-monospace, Menlo, Consolas, "Courier New", monospace';
+
+let W, H, SCENE_H, KX, KY, Y0, TEXT_ROW, fs, cw, lh, dpr;
+let chars, mats, lvls, zbuf;
+const REF_K = 30;            // sampling counts below are tuned for 30 rows per world unit
+let DEN_W = 1;               // extra sampling density for bigger screens
+let REC = null, RECW = null; // when set, geometry is recorded instead of drawn (caching)
+let wrapCache = null;
+let DEN_MUL = 1;            // lowered while flowers are mid-bloom to keep frames fast
+
+let PORTRAIT = false, CH_RATIO = 0.6;
+function fit() {
+  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  ctx.font = `100px ${FONT}`;
+  CH_RATIO = ctx.measureText("M").width / 100;
+  const vw = innerWidth, vh = innerHeight;
+  PORTRAIT = vh > vw * 1.1;
+  if (PORTRAIT) {
+    // phones: fixed 116 columns across the width, as many rows as fit the height
+    W = 116;
+    fs = (vw * 0.985) / (W * CH_RATIO);
+    H = Math.floor((vh * 0.985) / fs);
+  } else {
+    H = 112;
+    fs = (vh * 0.97) / H;
+    W = Math.floor((vw * 0.98) / (fs * CH_RATIO));
+    if (W < 80) { W = 80; fs = (vw * 0.98) / (W * CH_RATIO); H = Math.floor((vh * 0.97) / fs); }
+    W = Math.min(W, 260);
+  }
+  cw = fs * CH_RATIO; lh = fs;
+  cvs.style.width = W * cw + "px"; cvs.style.height = H * lh + "px";
+  cvs.width = Math.ceil(W * cw * dpr); cvs.height = Math.ceil(H * lh * dpr);
+  for (const g of glows) {                       // glow layers at reduced resolution (they get blurred anyway)
+    g.el.style.width = W * cw + "px"; g.el.style.height = H * lh + "px";
+    g.el.width = Math.ceil(W * cw * g.scale); g.el.height = Math.ceil(H * lh * g.scale);
+  }
+  buildStars();
+
+  const aspect = lh / cw;                      // a character cell is taller than it is wide
+  SCENE_H = H;
+  KY = Math.min((SCENE_H - 1) / 1.75, (W - 2) / (1.85 * aspect));  // rows per world unit
+  KX = KY * aspect;                                                // cols per world unit
+  Y0 = SCENE_H * (PORTRAIT ? 0.45 : 0.47);
+  // phones have spare height, so get closer
+  CAM.box.zoom = PORTRAIT ? 1.32 : 0.95;
+  CAM.box.yc   = PORTRAIT ? -0.42 : -0.3;
+  CAM.net.zoom = PORTRAIT ? 0.74 : 0.64;
+  CAM.bq.zoom  = PORTRAIT ? 1.22 : 1.0;
+  DEN_W = Math.max(1, KY / REF_K);
+  wrapCache = null; flowers.forEach(f => (f.cache = null));
+
+  chars = new Array(W * H); mats = new Int16Array(W * H); lvls = new Int8Array(W * H);
+  zbuf = new Float32Array(W * H);
+  buildRibbon();
+}
+
+// ---------- 3D -> screen ----------
+let YCv = -0.42;                        // vertical centre of the scene (animated)
+let KXz = 1, KYz = 1;                   // zoomed projection scales (animated)
+let cyw, syw, cp, sp;                   // current yaw / pitch (cos, sin)
+
+function project(x, y, z) {
+  const x1 = x * cyw - z * syw, z1 = x * syw + z * cyw, yy = y - YCv;
+  const y2 = yy * cp - z1 * sp, z2 = yy * sp + z1 * cp;
+  const zc = CAM_D - z2, s = CAM_D / zc;
+  return [W / 2 + x1 * KXz * s, Y0 - y2 * KYz * s, 1 / zc];
+}
+
+// rotate a world point + normal, project, depth-test, shade, write a character
+function emit(x, y, z, nx, ny, nz, mat, mul) {
+  if (RECW) { RECW.push(x, y, z, nx, ny, nz, mat, mul); return; }
+  const x1 = x * cyw - z * syw, z1 = x * syw + z * cyw, yy = y - YCv;
+  const y2 = yy * cp - z1 * sp, z2 = yy * sp + z1 * cp;
+  const zc = CAM_D - z2;
+  if (zc <= 0.1) return;
+  const ooz = 1 / zc, s = CAM_D * ooz;
+  const col = Math.round(W / 2 + x1 * KXz * s), row = Math.round(Y0 - y2 * KYz * s);
+  if (col < 0 || row < 0 || col >= W || row >= SCENE_H) return;
+  const idx = row * W + col;
+  if (ooz <= zbuf[idx]) return;
+
+  const n1x = nx * cyw - nz * syw, n1z = nx * syw + nz * cyw;
+  const n2y = ny * cp - n1z * sp, n2z = ny * sp + n1z * cp;
+  const l = Math.hypot(n1x, n2y, n2z) || 1;
+  let ux = n1x / l, uy = n2y / l, uz = n2z / l;
+  if (uz < 0) { ux = -ux; uy = -uy; uz = -uz; }      // two-sided petals
+  let d = ux * LX + uy * LY + uz * LZ; if (d < 0) d = 0;
+  const lum = (0.24 + 0.52 * d + 0.3 * uz) * mul;
+  const lv = Math.max(0, Math.min(LV - 1, Math.floor(lum * LV)));
+
+  zbuf[idx] = ooz; chars[idx] = RAMP[lv]; mats[idx] = mat; lvls[idx] = lv;
+}
+
+// a flower has its own frame: B = base point, a = axis (up), e1/e2 = sideways, s = scale
+let FLASH = 0;               // 0..1: chance a flower point is drawn white-hot (as it pops open)
+function emitLocal(F, lx, ly, lz, nx, ny, nz, mat, mul) {
+  if (REC) { REC.push(lx, ly, lz, nx, ny, nz, mat, mul); return; }
+  if (FLASH > 0 && Math.random() < FLASH) { mat = M.flash; mul = Math.max(mul, 1.1); }
+  const { B, a, e1, e2, s } = F;
+  emit(B[0] + (e1[0] * lx + a[0] * ly + e2[0] * lz) * s,
+       B[1] + (e1[1] * lx + a[1] * ly + e2[1] * lz) * s,
+       B[2] + (e1[2] * lx + a[2] * ly + e2[2] * lz) * s,
+       e1[0] * nx + a[0] * ny + e2[0] * nz,
+       e1[1] * nx + a[1] * ny + e2[1] * nz,
+       e1[2] * nx + a[2] * ny + e2[2] * nz, mat, mul);
+}
+
+// sample any parametric surface fn(P,u,v) and get normals from the cross product of its partials
+const _a = [0, 0, 0], _b = [0, 0, 0], _c = [0, 0, 0];
+function surface(F, fn, P, nu, nv, mat, ao) {
+  const eps = 1e-3;
+  const den = F ? Math.max(0.8, Math.min(2.4, Math.max(1, (F.s * KY) / REF_K)) * DEN_MUL) : DEN_W;
+  nu = Math.ceil(nu * den); nv = Math.ceil(nv * den);
+  for (let i = 0; i <= nu; i++) {
+    const u = i / nu;
+    const m = typeof mat === "function" ? mat(u) : mat;
+    const mul = ao ? 0.75 + 0.25 * u : 1;            // darker toward the petal base (fake occlusion)
+    for (let j = 0; j <= nv; j++) {
+      const v = -1 + (2 * j) / nv;
+      const edge = ao ? 1 - 0.55 * Math.pow(Math.abs(v), 6) - 0.35 * Math.pow(u, 14) : 1;
+      fn(P, u, v, _a); fn(P, u + eps, v, _b); fn(P, u, v + eps, _c);
+      const ux = _b[0] - _a[0], uy = _b[1] - _a[1], uz = _b[2] - _a[2];
+      const vx = _c[0] - _a[0], vy = _c[1] - _a[1], vz = _c[2] - _a[2];
+      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      if (F) emitLocal(F, _a[0], _a[1], _a[2], nx, ny, nz, m, mul * edge);
+      else emit(_a[0], _a[1], _a[2], nx, ny, nz, m, mul * edge);
+    }
+  }
+}
+
+/* ---------- THE PETAL ----------
+   Spine: a curve leaving the centre at angle th(u) = th0 + curl*u from the flower axis.
+     radial(u) = r0 + len * (cos th0 - cos th(u)) / curl
+     axial(u)  = lift + len * (sin th(u) - sin th0) / curl
+   Width:  w(u) = wid * sin(pi * (0.04 + 0.92 u^skew))^wexp
+   Cup:    the edges (|v|->1) bend toward the inside normal by cup * w * v^2
+   The whole petal is then rotated around the axis by phi.
+   Blooming = animating th0 (opening angle) and curl (how far the tip bends back). */
+function petal(P, u, v, out) {
+  const c = P.curl, t0 = P.th0;
+  let sr, sa;
+  if (Math.abs(c) < 1e-4) { sr = u * Math.sin(t0); sa = u * Math.cos(t0); }
+  else { sr = (Math.cos(t0) - Math.cos(t0 + c * u)) / c; sa = (Math.sin(t0 + c * u) - Math.sin(t0)) / c; }
+  sr = P.r0 + P.len * sr; sa = P.lift + P.len * sa;
+  const th = t0 + c * u;
+  const w = P.wid * Math.pow(Math.sin(Math.PI * (0.04 + 0.92 * Math.pow(Math.min(u, 1), P.skew))), P.wexp);
+  const off = P.cup * w * v * v;
+  const R = sr - Math.cos(th) * off, A = sa + Math.sin(th) * off, T = v * w;
+  const cf = Math.cos(P.phi), sf = Math.sin(P.phi);
+  out[0] = cf * R - sf * T; out[1] = A; out[2] = sf * R + cf * T;
+}
+const P = (o) => Object.assign({ r0: 0.005, lift: 0, cup: 0.5, curl: 0, wexp: 0.8, skew: 1 }, o);
+
+function sepals(F, b, n, len) {
+  const e = smooth(b / 0.5);
+  for (let k = 0; k < n; k++)
+    surface(F, petal, P({ phi: (k * 2 * Math.PI) / n + F.rot, th0: 0.15 + 1.9 * e, curl: 0.6 * e,
+      len, wid: 0.022, cup: 0.3, wexp: 1, skew: 0.8 }), 7, 3, M.sepal, true);
+}
+
+function sphere(F, cx, cy, cz, r, mat, nt = 3, np = 5) {
+  for (let i = 0; i <= nt; i++) {
+    const th = (Math.PI * i) / nt, st = Math.sin(th), ct = Math.cos(th);
+    for (let j = 0; j < np; j++) {
+      const ph = (2 * Math.PI * j) / np, nx = st * Math.cos(ph), nz = st * Math.sin(ph);
+      emitLocal(F, cx + r * nx, cy + r * ct, cz + r * nz, nx, ct, nz, mat, 1);
+    }
+  }
+}
+
+// Fermat / Vogel spiral seed head: rho = R*sqrt(n/N), angle = n * golden angle, on a dome
+function seedHead(F, R, dome, N, mat, lift) {
+  const den = Math.max(0.8, Math.min(2.4, Math.max(1, (F.s * KY) / REF_K)) * DEN_MUL);
+  N = Math.ceil(N * den * den);
+  for (let n = 0; n < N; n++) {
+    const rho = R * Math.sqrt((n + 0.5) / N), ang = n * GA, q = rho / R;
+    const x = rho * Math.cos(ang), z = rho * Math.sin(ang), y = lift + dome * R * (1 - q * q);
+    emitLocal(F, x, y, z, (2 * dome * x) / R, 1, (2 * dome * z) / R, mat, 0.82 + 0.18 * Math.sin(n * 1.7));
+  }
+}
+
+// ---------- flower recipes ----------
+const FLOWER = {
+  rose(F, b) {
+    // 13 petals in golden-angle phyllotaxis; outer petals open first, inner stay a tight bud
+    const K = 13;
+    for (let k = 0; k < K; k++) {
+      const f = k / (K - 1);
+      const e = smooth((b - (1 - f) * 0.45) / 0.55);
+      const target = 0.12 + 1.25 * Math.pow(f, 1.3);
+      surface(F, petal, P({ phi: k * GA + F.rot, th0: 0.04 + (target - 0.04) * e,
+        curl: (0.15 + 0.85 * f * f) * e, len: 0.075 + 0.08 * f, wid: 0.05 + 0.045 * f,
+        cup: 0.9 - 0.4 * f * e, r0: 0.004 + 0.012 * f, lift: 0.01 * (1 - f), wexp: 0.6, skew: 1.5 }),
+        12, 8, F.mat, true);
+    }
+    sepals(F, b, 5, 0.07);
+  },
+
+  tulip(F, b) {
+    // 6 cupped petals in two layers, tips curling back in
+    const e = smooth(b);
+    for (let k = 0; k < 6; k++) {
+      const outer = k % 2 === 0;
+      surface(F, petal, P({ phi: (k * Math.PI) / 3 + F.rot, th0: 0.1 + (outer ? 0.52 : 0.44) * e,
+        curl: -(0.1 + 0.5 * e), len: 0.17, wid: outer ? 0.075 : 0.068, cup: 0.9,
+        r0: 0.008, wexp: 0.5, skew: 1.3 }), 12, 8, F.mat, true);
+    }
+  },
+
+  daisy(F, b) {
+    const e = smooth(b);
+    seedHead(F, 0.04 * (0.5 + 0.5 * e), 0.45, 240, M.yellow, 0.012);
+    const N = 14;
+    for (let k = 0; k < N; k++) {
+      const st = smooth((b - (k % 3) * 0.08) / 0.84);
+      surface(F, petal, P({ phi: (k * 2 * Math.PI) / N + 0.05 * Math.sin(k * 7) + F.rot,
+        th0: 0.12 + 1.33 * st, curl: 0.2 * st, len: 0.14, wid: 0.017, cup: 0.5,
+        r0: 0.035, lift: 0.01, wexp: 1, skew: 0.9 }), 10, 3, M.white, true);
+    }
+    sepals(F, b, 8, 0.05);
+  },
+
+  sunflower(F, b) {
+    const e = smooth(b);
+    seedHead(F, 0.085 * (0.45 + 0.55 * e), 0.35, 700, M.sunCenter, 0.015);
+    for (let ring = 0; ring < 2; ring++) {
+      const st = smooth((b - ring * 0.15) / 0.85);
+      for (let k = 0; k < 13; k++) {
+        surface(F, petal, P({ phi: ((k + ring * 0.5) * 2 * Math.PI) / 13 + F.rot,
+          th0: 0.15 + (ring ? 1.15 : 1.4) * st, curl: 0.3 * st, len: 0.15, wid: 0.028,
+          cup: 0.35, r0: 0.075 * (0.5 + 0.5 * e), lift: 0.008, wexp: 0.9, skew: 0.9 }),
+          10, 4, M.sunPetal, true);
+      }
+    }
+    sepals(F, b, 12, 0.07);
+  },
+
+  lily(F, b) {
+    // 6 long pointed petals that recurve (curl > 90 deg) + stamens with anthers
+    const e = smooth(b);
+    for (let k = 0; k < 6; k++) {
+      surface(F, petal, P({ phi: (k * Math.PI) / 3 + F.rot, th0: 0.05 + 0.5 * e, curl: 2.2 * e,
+        len: 0.22, wid: k % 2 ? 0.045 : 0.055, cup: 0.5, r0: 0.006, wexp: 1, skew: 0.75 }),
+        16, 6, u => (u < 0.4 ? M.lilyPink : M.lilyWhite), true);
+    }
+    if (e > 0.2) {
+      const L = 0.15 * smooth((e - 0.2) / 0.8);
+      for (let k = 0; k < 6; k++) {
+        const ps = (k * Math.PI) / 3 + Math.PI / 6 + F.rot, sx = Math.sin(0.3) * Math.cos(ps),
+              sy = Math.cos(0.3), sz = Math.sin(0.3) * Math.sin(ps);
+        for (let i = 0; i <= 10; i++) {
+          const t = (i / 10) * L;
+          emitLocal(F, sx * t, 0.01 + sy * t, sz * t, Math.cos(ps), 0, Math.sin(ps), M.stem, 1);
+        }
+        sphere(F, sx * L, 0.01 + sy * L, sz * L, 0.014, M.stamen);
+      }
+    }
+  },
+
+  lavender(F, b) {
+    // florets on a phyllotactic helix up a spike, opening bottom -> top
+    const N = 44;
+    for (let i = 0; i <= 20; i++) emitLocal(F, 0, (i / 20) * 0.28 * b, 0, 1, 0, 0, M.stem, 1);
+    for (let k = 0; k < N; k++) {
+      const h = k / N, sc = clamp01((b * 1.1 - h) * 5);
+      if (sc <= 0) continue;
+      const ang = k * GA, rho = 0.022 * (1 - 0.6 * h);
+      sphere(F, rho * Math.cos(ang), 0.02 + h * 0.26, rho * Math.sin(ang), 0.016 * sc, M.lavender);
+    }
+  },
+
+  breath(F, b) {
+    const e = smooth(b);
+    for (let k = 0; k < 13; k++) {
+      const z = k / 13, rr = Math.sqrt(1 - z * z), ang = k * GA;
+      sphere(F, 0.055 * rr * Math.cos(ang), 0.02 + 0.055 * z, 0.055 * rr * Math.sin(ang), 0.011 * e, M.breath, 2, 4);
+    }
+  },
+};
+const SIZE = { rose: 1.15, tulip: 1.1, daisy: 1.15, sunflower: 1.05, lily: 1.0, lavender: 1.1, breath: 1.2 };
+
+// ---------- bouquet layout: flower heads on a spherical cap ----------
+const CENTER = [0, -0.66, 0], DOME_R = 0.74, GATHER = [0, -0.85, 0];
+// alpha = how far from the top of the dome, beta = direction around it (PI/2 = facing you)
+const F_ = Math.PI / 2;
+const items = [
+  { t: "sunflower", alpha: 0.18, beta: F_,        lift: 0.5 },
+  { t: "rose",      alpha: 0.52, beta: F_ + 0.1,  lift: 0.5 },
+  { t: "rose",      alpha: 0.62, beta: F_ - 1.2,  lift: 0.5 },
+  { t: "lily",      alpha: 0.62, beta: F_ + 1.2,  lift: 0.5 },
+  { t: "rosePink",  alpha: 0.95, beta: F_ + 0.5,  lift: 0.45 },
+  { t: "daisy",     alpha: 0.95, beta: F_ - 0.5,  lift: 0.45 },
+  { t: "tulip",     alpha: 0.7,  beta: F_ + 2.4,  lift: 0.5 },
+  { t: "daisy",     alpha: 0.7,  beta: F_ - 2.4,  lift: 0.5 },
+  { t: "tulipY",    alpha: 1.1,  beta: F_ - 1.45, lift: 0.4 },
+  { t: "rose",      alpha: 1.1,  beta: F_ + 1.5,  lift: 0.4 },
+  { t: "lily",      alpha: 0.55, beta: F_ + Math.PI, lift: 0.6 },
+  { t: "lavender",  alpha: 1.0,  beta: F_ + Math.PI - 0.7, lift: 1.3 },
+  { t: "lavender",  alpha: 1.0,  beta: F_ + Math.PI + 0.7, lift: 1.3 },
+  { t: "lavender",  alpha: 1.15, beta: F_ + 2.0,  lift: 1.1 },
+  { t: "lavender",  alpha: 1.15, beta: F_ - 2.0,  lift: 1.1 },
+  { t: "breath",    alpha: 0.5,  beta: F_ + 0.75, lift: 0.6 },
+  { t: "breath",    alpha: 1.2,  beta: F_,        lift: 0.4 },
+  { t: "breath",    alpha: 0.85, beta: F_ + 2.7,  lift: 0.6 },
+  { t: "breath",    alpha: 0.85, beta: F_ - 2.7,  lift: 0.6 },
+  { t: "breath",    alpha: 0.4,  beta: F_ - 0.9,  lift: 0.6 },
+];
+
+const flowers = items.map((it, i) => {
+  const d = [Math.sin(it.alpha) * Math.cos(it.beta), Math.cos(it.alpha), Math.sin(it.alpha) * Math.sin(it.beta)];
+  const B = [CENTER[0] + d[0] * DOME_R, CENTER[1] + d[1] * DOME_R, CENTER[2] + d[2] * DOME_R];
+  const type = it.t === "tulipY" ? "tulip" : it.t === "rosePink" ? "rose" : it.t;
+  const mat = it.t === "rosePink" ? M.pink : it.t === "tulipY" ? M.tulipYellow : type === "tulip" ? M.tulipPink : M.red;
+  return {
+    type, mat, B0: B, a0: norm(d[0], d[1] + it.lift, d[2] + (it.t === "lavender" ? 0.2 : 0.75)),   // heads angled toward you
+    delay: i * STAGGER, rot: i * 1.3, ph: i * 2.1, burst: false, cache: null,
+    leafSide: i % 2 ? 1 : -1,
+  };
+});
+const ALL_DONE = Math.max(...flowers.map(f => f.delay)) + GROW + BLOOM;
+const TEXT_START = ALL_DONE + 0.2;
+
+// ---------- stems (tubes along a quadratic Bezier), leaves, wrap, ribbon ----------
+function bez(p0, p1, p2, t) {
+  const u = 1 - t;
+  return [0, 1, 2].map(k => u * u * p0[k] + 2 * u * t * p1[k] + t * t * p2[k]);
+}
+function bezD(p0, p1, p2, t) {
+  return [0, 1, 2].map(k => 2 * (1 - t) * (p1[k] - p0[k]) + 2 * t * (p2[k] - p1[k]));
+}
+
+function stem(p0, p1, p2, g) {
+  const steps = Math.ceil(80 * DEN_W), RAD = 0.011;
+  for (let i = 0; i <= steps * g; i++) {
+    const t = i / steps, p = bez(p0, p1, p2, t), T = norm(...bezD(p0, p1, p2, t));
+    const ref = Math.abs(T[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+    const n1 = norm(...cross(T, ref)), n2 = cross(T, n1);
+    for (let k = 0; k < 6; k++) {
+      const c = Math.cos((k * Math.PI) / 3), s = Math.sin((k * Math.PI) / 3);
+      const nx = n1[0] * c + n2[0] * s, ny = n1[1] * c + n2[1] * s, nz = n1[2] * c + n2[2] * s;
+      emit(p[0] + nx * RAD, p[1] + ny * RAD, p[2] + nz * RAD, nx, ny, nz, M.stem, 0.7);
+    }
+  }
+}
+
+// leaf: lanceolate blade w(u) = wid*sin(pi u)^0.8, drooping as u^2, cupped as v^2
+function leafFn(L, u, v, out) {
+  const w = L.wid * Math.pow(Math.sin(Math.PI * Math.min(u, 1)), 0.8);
+  const droop = -0.25 * L.len * u * u, cupv = 0.3 * w * v * v;
+  for (let k = 0; k < 3; k++)
+    out[k] = L.S[k] + L.D[k] * L.len * u + L.side[k] * v * w + (k === 1 ? droop : 0) + L.N[k] * cupv;
+}
+
+function wrap() {
+  const APEX = -1.05, TOP = -0.3, WR = 0.48, NA = Math.ceil(170 * DEN_W), NH = Math.ceil(42 * DEN_W);
+  for (let i = 0; i < NA; i++) {
+    const ph = (2 * Math.PI * i) / NA, c = Math.cos(ph), s = Math.sin(ph);
+    const pleat = 0.72 + 0.28 * Math.cos(12 * ph);
+    for (let j = 0; j <= NH; j++) {
+      const h = j / NH, r = WR * h;
+      const y = APEX + h * (TOP - APEX) + 0.035 * Math.sin(9 * ph) * Math.pow(h, 10);
+      emit(r * c, y, r * s, c, -WR / (TOP - APEX), s, M.paper, pleat);
+    }
+  }
+  // ribbon: a torus hugging the cone
+  const RY = -0.78, RR = 0.18, rr = 0.02;
+  for (let i = 0; i < 140; i++) {
+    const al = (2 * Math.PI * i) / 140, ca = Math.cos(al), sa = Math.sin(al);
+    for (let j = 0; j < 8; j++) {
+      const be = (2 * Math.PI * j) / 8, cb = Math.cos(be), sb = Math.sin(be);
+      emit((RR + rr * cb) * ca, RY + rr * sb, (RR + rr * cb) * sa, cb * ca, sb, cb * sa, M.ribbon, 1);
+    }
+  }
+  // bow: two tilted torus loops + a knot, on the front
+  const BZ = RR + 0.03;
+  for (const side of [-1, 1]) {
+    const cx = side * 0.06;
+    for (let i = 0; i < 60; i++) {
+      const al = (2 * Math.PI * i) / 60, ca = Math.cos(al), sa = Math.sin(al);
+      for (let j = 0; j < 6; j++) {
+        const be = (2 * Math.PI * j) / 6, cb = Math.cos(be), sb = Math.sin(be);
+        const R1 = 0.055, r1 = 0.016;
+        const px = cx + (R1 + r1 * cb) * ca, py = RY + 0.012 + (R1 + r1 * cb) * sa * 0.75;
+        emit(px, py, BZ + r1 * sb + side * ca * 0.02, cb * ca, cb * sa, sb, M.ribbon, 1);
+      }
+    }
+    for (let i = 0; i <= 14; i++) {
+      const t = i / 14;
+      for (let j = -2; j <= 2; j++)
+        emit(side * (0.015 + 0.06 * t) + j * 0.004, RY - 0.01 - 0.15 * t, BZ + 0.02 * t, 0, 0.2, 1, M.ribbon, 0.9);
+    }
+  }
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 6; j++) {
+    const th = (Math.PI * i) / 3, ph = (2 * Math.PI * j) / 6;
+    const nx = Math.sin(th) * Math.cos(ph), ny = Math.cos(th), nz = Math.sin(th) * Math.sin(ph);
+    emit(0.024 * nx, RY + 0.012 + 0.024 * ny, BZ + 0.024 * nz, nx, ny, nz, M.ribbon, 1);
+  }
+}
+
+// ---------- sparkles ----------
+let sparkles = [];
+const SPARK = [".", "+", "*", "+", "."];
+const SPARK_C = ["#fff6b0", "#ffffff", "#ffd6f0", "#c9e7ff"];
+function addSparkle(x, y, T, life) {
+  sparkles.push({ x: Math.round(x), y: Math.round(y), born: T, life, c: SPARK_C[(Math.random() * 4) | 0] });
+}
+
+// ---------- silhouettes: darken cells where depth jumps (object boundaries) ----------
+let edgeMask = null;
+function outline() {
+  if (!edgeMask || edgeMask.length !== W * H) edgeMask = new Uint8Array(W * H);
+  edgeMask.fill(0);
+  for (let y = 0; y < SCENE_H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x, z = zbuf[i];
+      if (z === 0) continue;
+      const r = x + 1 < W ? zbuf[i + 1] : 0, d = y + 1 < SCENE_H ? zbuf[i + W] : 0;
+      const l = x > 0 ? zbuf[i - 1] : 0, u = y > 0 ? zbuf[i - W] : 0;
+      // nearer cell next to a much farther (or empty) one = an edge
+      if (z - r > 0.008 || z - d > 0.008 || z - l > 0.008 || z - u > 0.008) edgeMask[i] = 1;
+    }
+  }
+  // edge cells get a stroke that follows the edge: - | / \  (tangent = depth gradient turned 90 deg)
+  const drop = PORTRAIT ? 2 : 3;
+  for (let y = 0; y < SCENE_H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (!edgeMask[i]) continue;
+      const zr = x + 1 < W ? zbuf[i + 1] : 0, zl = x > 0 ? zbuf[i - 1] : 0;
+      const zd = y + 1 < SCENE_H ? zbuf[i + W] : 0, zu = y > 0 ? zbuf[i - W] : 0;
+      const gx = (zr - zl) / cw, gy = (zd - zu) / lh;
+      let ang = (Math.atan2(gy, gx) * 180) / Math.PI + 90;
+      ang = ((ang % 180) + 180) % 180;
+      const ch = ang < 22.5 || ang >= 157.5 ? "-" : ang < 67.5 ? "\\" : ang < 112.5 ? "|" : "/";
+      const lv = Math.max(2, lvls[i] - drop);
+      lvls[i] = lv; chars[i] = ch;
+    }
+  }
+}
+
+/* =====================================================================
+   GIFT BOX INTRO
+   Closed red box + yellow ribbon + big 3D bow  ->  tap  ->  ribbon
+   unravels into a straight line that slides off both edges  ->  lid
+   pops off, walls fall flat (the box "net"), confetti bursts out and
+   swirls down to form the bouquet's wrap  ->  stems grow, flowers bloom.
+   ===================================================================== */
+const GROUND = -1.05;                 // the floor (bouquet's wrap tip sits here)
+const BS = 0.9, BH = BS / 2;          // box side, half side
+const LID_H = 0.17, LID_OUT = 0.022;  // lid rim height, how far the lid overhangs
+const LID_TOP = GROUND + BS + LID_OUT;
+const STRIPE = 0.085;                 // half-width of the yellow stripes
+
+// timeline after the tap (seconds)
+const T_UNRAVEL = 0.55;               // (after a little tug) the bow starts unravelling
+const PEEL      = 0.65;               // how long each bit of ribbon takes to fly into the line
+const T_SLIDE   = 2.6;                // straight line splits and slides off both edges
+const SLIDE_DUR = 0.8;
+const T_EXPLODE = 3.5;                // lid pops, walls fall, confetti
+const T_HOME    = T_EXPLODE + 0.9;    // puzzle pieces start flying in (camera starts moving to the bouquet)
+const PZ_STAGGER = 0.12;              // gap between puzzle pieces
+const PZ_FLY    = 0.9;                // flight time of each piece
+const T_BOWDROP = T_EXPLODE + 3.9;    // ribbon + bow drop onto the finished wrap
+const T_WRAP    = T_EXPLODE + 4.45;   // wrap has fully formed
+const T_BOUQUET = T_WRAP - 0.1;       // stems start growing
+
+// camera: box close-up -> wide shot of the opened net -> bouquet
+const CAM = {
+  box:  { pitch: 0.42, zoom: 1.22, yc: -0.42 },
+  net:  { pitch: 0.98, zoom: 0.64, yc: -0.98 },
+  bq:   { pitch: 0.6,  zoom: 1.0,  yc: -0.5 },
+};
+
+const lerp = (a, b, t) => a + (b - a) * t;
+function bounceOut(x) {
+  const n1 = 7.5625, d1 = 2.75;
+  if (x < 1 / d1) return n1 * x * x;
+  if (x < 2 / d1) return n1 * (x -= 1.5 / d1) * x + 0.75;
+  if (x < 2.5 / d1) return n1 * (x -= 2.25 / d1) * x + 0.9375;
+  return n1 * (x -= 2.625 / d1) * x + 0.984375;
+}
+function viewNz(nx, ny, nz) { const n1z = nx * syw + nz * cyw; return ny * sp + n1z * cp; }
+
+// ---------- box walls: each folds about its bottom edge by theta (0 = closed, PI/2 = flat) ----------
+function drawWalls(theta, hop, dim) {
+  const n = Math.min(150, Math.ceil(BS * KXz * 1.15));
+  const ct = Math.cos(theta), st = Math.sin(theta);
+  for (let k = 0; k < 4; k++) {
+    const ph = (k * Math.PI) / 2, c = Math.cos(ph), s = Math.sin(ph);
+    const onx = ct * s, ony = -st, onz = ct * c;            // outward normal of the outside layer
+    for (const layer of [1, -1]) {
+      if (layer < 0 && theta < 0.02) continue;             // inside of a closed box is never seen
+      const nx = onx * layer, ny = ony * layer, nz = onz * layer;
+      if (viewNz(nx, ny, nz) < -0.03) continue;           // back-face cull
+      const zo = 0.006 * layer;
+      for (let i = 0; i <= n; i++) {
+        const x = -BH + (BS * i) / n;
+        const mat = layer < 0 && Math.abs(x) < STRIPE ? M.gold : M.box;
+        for (let j = 0; j <= n; j++) {
+          const yy = (BS * j) / n;
+          const dy = yy * ct - zo * st, dz = yy * st + zo * ct;
+          const lz = BH + dz, ly = GROUND + dy + hop;
+          emit(x * c + lz * s, ly, -x * s + lz * c, nx, ny, nz, mat, layer < 0 ? dim : 1);
+        }
+      }
+    }
+  }
+}
+
+function drawFloor(dim) {
+  const n = Math.min(150, Math.ceil(BS * KXz * 1.15));
+  for (let i = 0; i <= n; i++) {
+    const x = -BH + (BS * i) / n;
+    for (let j = 0; j <= n; j++) {
+      const z = -BH + (BS * j) / n;
+      const mat = Math.abs(x) < STRIPE || Math.abs(z) < STRIPE ? M.gold : M.box;
+      emit(x, GROUND + 0.006, z, 0, 1, 0, mat, dim);
+    }
+  }
+}
+
+// ---------- lid: sits on the box, then pops off tumbling ----------
+function drawLid(tl, hop) {
+  let tx = 0, ty = LID_TOP - LID_H / 2 + hop, tz = 0, rx = 0, rz = 0;
+  if (tl > 0) {
+    if (tl > 1.5) return;
+    ty += 3.4 * tl + 3 * tl * tl; tz += 0.5 * tl; tx += 0.35 * tl;
+    rx = -2.8 * tl; rz = 1.6 * tl;
+  }
+  const cxr = Math.cos(rx), sxr = Math.sin(rx), czr = Math.cos(rz), szr = Math.sin(rz);
+  const rot = (x, y, z, o) => {
+    const y1 = y * cxr - z * sxr, z1 = y * sxr + z * cxr;
+    o[0] = x * czr - y1 * szr; o[1] = x * szr + y1 * czr; o[2] = z1;
+  };
+  const L = BH + LID_OUT, hh = LID_H / 2;
+  const faces = [
+    [[0, hh, 0], [1, 0, 0], [0, 0, 1], [0, 1, 0], 2 * L, 2 * L, M.box],
+    [[0, hh - 0.008, 0], [1, 0, 0], [0, 0, 1], [0, -1, 0], 2 * L, 2 * L, M.boxDark],
+    [[0, 0, L], [1, 0, 0], [0, 1, 0], [0, 0, 1], 2 * L, LID_H, M.boxDark],
+    [[0, 0, -L], [1, 0, 0], [0, 1, 0], [0, 0, -1], 2 * L, LID_H, M.boxDark],
+    [[L, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0], 2 * L, LID_H, M.boxDark],
+    [[-L, 0, 0], [0, 0, 1], [0, 1, 0], [-1, 0, 0], 2 * L, LID_H, M.boxDark],
+  ];
+  const nW = [0, 0, 0], pW = [0, 0, 0];
+  for (const [cen, u, v, nrm, ul, vl, mat] of faces) {
+    rot(nrm[0], nrm[1], nrm[2], nW);
+    if (viewNz(nW[0], nW[1], nW[2]) < -0.03) continue;
+    const nu = Math.min(150, Math.ceil(ul * KXz * 1.15)), nv = Math.min(150, Math.ceil(vl * KXz * 1.15));
+    for (let i = 0; i <= nu; i++) {
+      const a = (i / nu - 0.5) * ul;
+      for (let j = 0; j <= nv; j++) {
+        const b = (j / nv - 0.5) * vl;
+        rot(cen[0] + u[0] * a + v[0] * b, cen[1] + u[1] * a + v[1] * b, cen[2] + u[2] * a + v[2] * b, pW);
+        emit(pW[0] + tx, pW[1] + ty, pW[2] + tz, nW[0], nW[1], nW[2], mat, 1);
+      }
+    }
+  }
+}
+
+// ---------- ribbon + bow: one continuous strip, so it can unravel into a line ----------
+// stored per sample: x, y, z, nx, ny, nz, s (0..1 position along the whole ribbon), v (-1..1 across)
+let ribbon = null, S_KNOT = 0.5, RIB_K = [0, 0, 0];
+function buildRibbon() {
+  const k = KX * CAM.box.zoom * 1.25;                    // samples per world unit
+  const L = BH + LID_OUT + 0.008;
+  const off = y => (y >= LID_TOP - LID_H ? L : BH + 0.008);
+  const y0 = LID_TOP + 0.012;
+  const K = [0, y0 + 0.07, 0.02];                        // knot centre
+  RIB_K = K;
+  const R1 = 0.31, R2 = 0.2, LEAN = 0.42;                // bow loop size + backwards lean
+  const H = LID_TOP - GROUND;
+
+  const loopF = sg => t => {
+    const a = 2 * Math.PI * t, ex = sg * R1 * (1 - Math.cos(a)), ey = R2 * Math.sin(a);
+    const g = sg * 0.5, x1 = ex * Math.cos(g) - ey * Math.sin(g), y1 = ex * Math.sin(g) + ey * Math.cos(g);
+    return [K[0] + x1, K[1] + y1 * Math.cos(LEAN), K[2] - y1 * Math.sin(LEAN)];
+  };
+  const tailPts = sg => [[sg * 0.03, y0 + 0.035, 0.08], [sg * 0.17, y0 + 0.006, 0.3],
+                          [sg * 0.23, y0 + 0.006, L], [sg * 0.29, y0 - 0.24, L + 0.004]];
+  const poly = pts => t => {
+    const n = pts.length - 1, f = Math.min(n - 1e-9, t * n), i = Math.floor(f), u = f - i;
+    return [0, 1, 2].map(c => lerp(pts[i][c], pts[i + 1][c], u));
+  };
+  const loopW = () => [0, Math.sin(LEAN), Math.cos(LEAN)];
+  const tailW = (p, T) => norm(...cross(Math.abs(T[1]) > 0.7 ? [0, 0, 1] : [0, 1, 0], T));
+
+  const pieces = [
+    { f: t => [0, GROUND + t * H, off(GROUND + t * H)], w: () => [1, 0, 0], hw: STRIPE },          // front stripe up
+    { f: t => [0, LID_TOP + 0.008, L - 2 * L * t], w: () => [1, 0, 0], hw: STRIPE },               // over the lid
+    { f: t => [0, LID_TOP - t * H, -off(LID_TOP - t * H)], w: () => [1, 0, 0], hw: STRIPE },      // back stripe down
+    { f: t => poly(tailPts(-1).reverse())(t), w: tailW, hw: 0.065, kind: 1 },                                // left tail
+    { f: loopF(-1), w: loopW, hw: 0.11, tube: 0.05, kind: 2 },                                               // left loop
+    { knot: true },
+    { f: loopF(1), w: loopW, hw: 0.11, tube: 0.05, kind: 2 },                                                // right loop
+    { f: poly(tailPts(1)), w: tailW, hw: 0.065, kind: 1 },                                                    // right tail
+    { f: t => [off(GROUND + t * H), GROUND + t * H, 0], w: () => [0, 0, 1], hw: STRIPE },          // right stripe up
+    { f: t => [L - 2 * L * t, LID_TOP + 0.008, 0], w: () => [0, 0, 1], hw: STRIPE },               // over the lid
+    { f: t => [-off(LID_TOP - t * H), LID_TOP - t * H, 0], w: () => [0, 0, 1], hw: STRIPE },      // left stripe down
+  ];
+
+  // measure lengths
+  let total = 0;
+  for (const pc of pieces) {
+    if (pc.knot) { pc.len = 0.25; total += pc.len; continue; }
+    let len = 0, prev = pc.f(0);
+    for (let i = 1; i <= 200; i++) { const q = pc.f(i / 200); len += Math.hypot(q[0] - prev[0], q[1] - prev[1], q[2] - prev[2]); prev = q; }
+    pc.len = len; total += len;
+  }
+  const out = [];
+  let acc = 0;
+  for (const pc of pieces) {
+    if (pc.knot) {
+      S_KNOT = (acc + pc.len / 2) / total;
+      const nt = Math.ceil(0.2 * k) + 3, np = Math.ceil(0.45 * k) + 4;
+      for (let i = 0; i <= nt; i++) {
+        const th = (Math.PI * i) / nt;
+        for (let j = 0; j < np; j++) {
+          const ph = (2 * Math.PI * j) / np, nx = Math.sin(th) * Math.cos(ph), ny = Math.cos(th), nz = Math.sin(th) * Math.sin(ph);
+          out.push(K[0] + 0.08 * nx, K[1] + 0.065 * ny, K[2] + 0.075 * nz, nx, ny, nz, S_KNOT, 0, 3);
+        }
+      }
+      acc += pc.len; continue;
+    }
+    const n = Math.ceil(pc.len * k), nv = Math.max(2, Math.ceil(2 * pc.hw * k));
+    for (let i = 0; i <= n; i++) {
+      const t = i / n, p = pc.f(t), q = pc.f(Math.min(1, t + 0.002)), r = pc.f(Math.max(0, t - 0.002));
+      const T = norm(q[0] - r[0], q[1] - r[1], q[2] - r[2]);
+      const w = pc.w(p, T), nn = norm(...cross(T, w));
+      const sG = (acc + t * pc.len) / total;
+      if (pc.tube) {                                   // loops: a squashed tube, so they look puffy from any angle
+        const nb = Math.max(10, Math.ceil(2 * Math.PI * pc.hw * k));
+        for (let j = 0; j < nb; j++) {
+          const be = (2 * Math.PI * j) / nb, cb = Math.cos(be), sb = Math.sin(be);
+          const ox = nn[0] * pc.tube * cb + w[0] * pc.hw * sb, oy = nn[1] * pc.tube * cb + w[1] * pc.hw * sb,
+                oz = nn[2] * pc.tube * cb + w[2] * pc.hw * sb;
+          const q = norm(nn[0] * cb / pc.tube + w[0] * sb / pc.hw, nn[1] * cb / pc.tube + w[1] * sb / pc.hw,
+                         nn[2] * cb / pc.tube + w[2] * sb / pc.hw);
+          out.push(p[0] + ox, p[1] + oy, p[2] + oz, q[0], q[1], q[2], sG, sb, pc.kind || 0);
+        }
+        continue;
+      }
+      for (let j = 0; j <= nv; j++) {
+        const v = -1 + (2 * j) / nv, cup = (pc.cup || 0) * (1 - v * v);
+        out.push(p[0] + w[0] * v * pc.hw + nn[0] * cup, p[1] + w[1] * v * pc.hw + nn[1] * cup,
+                 p[2] + w[2] * v * pc.hw + nn[2] * cup, nn[0], nn[1], nn[2], sG, v, pc.kind || 0);
+      }
+    }
+    acc += pc.len;
+  }
+  ribbon = Float32Array.from(out);
+}
+
+let gleamS = -1;
+function drawRibbon(tt, hop) {
+  if (tt > T_SLIDE + SLIDE_DUR) return;
+  gleamS = ((nowT * 0.32) % 1.6) - 0.3;
+  const LINE_LEN = 5.4, LYv = LID_TOP + 0.22, LZv = 0.75, HWL = 0.035, K = RIB_K;
+  // 1) the tug: bow puffs up and wobbles before it lets go
+  const ua = clamp01(tt / T_UNRAVEL);
+  const puff = tt > 0 ? Math.sin(Math.PI * ua) * 0.17 : 0;
+  const wob = tt > 0 ? Math.sin(tt * 34) * 0.12 * Math.sin(Math.PI * ua) : 0;
+  // 3) the finished line splits in the middle and slides off both ends
+  const slideT = clamp01((tt - T_SLIDE) / SLIDE_DUR);
+  const slide = slideT * slideT * 4.8;
+  const r = ribbon;
+  for (let i = 0; i < r.length; i += 9) {
+    const s = r[i + 6], v = r[i + 7], kind = r[i + 8];
+    let x = r[i], y = r[i + 1] + hop, z = r[i + 2], nx = r[i + 3], ny = r[i + 4], nz = r[i + 5];
+    if (kind >= 2 && puff) {
+      const dx = x - K[0], dy = y - K[1], dz = z - K[2];
+      x = K[0] + dx * (1 + puff) + dy * wob; y = K[1] + dy * (1 + puff * 1.2) - dx * wob; z = K[2] + dz * (1 + puff);
+    }
+    // 2) a peeling front runs from the knot outward; each bit arcs toward you, twirls, and lands in the line
+    const tArr = T_UNRAVEL + Math.abs(s - S_KNOT) * 1.9;
+    const p = clamp01((tt - tArr) / PEEL);
+    if (p > 0) {
+      const e = p * p * (3 - 2 * p), side = s < S_KNOT ? -1 : 1;
+      const X = (s - 0.5) * LINE_LEN + side * slide;
+      const since = tt - tArr - PEEL;                                     // snap ripple after landing
+      const rip = since > 0 ? 0.07 * Math.sin(X * 5 - tt * 13) * Math.exp(-since * 2.2) * (1 - slideT) : 0;
+      const tw = (1 - e) * Math.PI * 2.5 * side;                         // twirl while flying
+      const tX = X, tY = LYv + rip + Math.cos(tw) * v * HWL, tZ = LZv + Math.sin(tw) * v * HWL;
+      const cX = (x + tX) / 2, cY = Math.max(y, LYv) + 0.18, cZ = (z + LZv) / 2 + 0.3;   // arc control point
+      const u = 1 - e;
+      x = u * u * x + 2 * u * e * cX + e * e * tX;
+      y = u * u * y + 2 * u * e * cY + e * e * tY;
+      z = u * u * z + 2 * u * e * cZ + e * e * tZ;
+      nx = lerp(nx, 0, e); ny = lerp(ny, -Math.sin(tw) + 0.15, e); nz = lerp(nz, Math.cos(tw), e);
+    }
+    // a shine slides along the ribbon
+    const gd = (s - gleamS) / 0.03, gl = gd * gd < 9 ? Math.exp(-gd * gd) : 0;
+    emit(x, y, z, nx, ny, nz, gl > 0.55 ? M.flash : M.gold, 1.12 + gl * 0.8);
+  }
+}
+
+// ---------- confetti ----------
+let confetti = [];
+const CONF_MATS = [M.red, M.tulipYellow, M.pink, M.white, M.lavender, M.blue, M.leaf, M.sunPetal, M.gold];
+const CONF_GLYPHS = ["*", "+", "o", "~", "x", "%", "&", "#", "=", "@"];
+function spawnConfetti() {
+  confetti = [];
+  const nW = wrapCache.length / 8;
+  for (let i = 0; i < 520; i++) {
+    const ang = Math.random() * Math.PI * 2, sp = 0.4 + Math.random() * 1.7;
+    const ti = ((Math.random() * nW) | 0) * 8;
+    confetti.push({
+      p0: [(Math.random() - 0.5) * 0.5, GROUND + 0.4 + Math.random() * 0.3, (Math.random() - 0.5) * 0.5],
+      v: [Math.cos(ang) * sp, 2.6 + Math.random() * 2.4, Math.sin(ang) * sp],
+      tgt: [wrapCache[ti], wrapCache[ti + 1], wrapCache[ti + 2]],
+      j: Math.random(), mat: CONF_MATS[(Math.random() * CONF_MATS.length) | 0],
+      g1: CONF_GLYPHS[(Math.random() * CONF_GLYPHS.length) | 0], g2: CONF_GLYPHS[(Math.random() * CONF_GLYPHS.length) | 0],
+      spin: 6 + Math.random() * 10, swirl: 4.5 + Math.random() * 3.5, h: Math.random(),
+    });
+  }
+}
+
+function emitChar(x, y, z, ch, mat, lv) {
+  const x1 = x * cyw - z * syw, z1 = x * syw + z * cyw, yy = y - YCv;
+  const y2 = yy * cp - z1 * sp, z2 = yy * sp + z1 * cp;
+  const zc = CAM_D - z2;
+  if (zc <= 0.1) return;
+  const ooz = 1 / zc, s = CAM_D * ooz;
+  const col = Math.round(W / 2 + x1 * KXz * s), row = Math.round(Y0 - y2 * KYz * s);
+  if (col < 0 || row < 0 || col >= W || row >= SCENE_H) return;
+  const idx = row * W + col;
+  if (ooz <= zbuf[idx]) return;
+  zbuf[idx] = ooz; chars[idx] = ch; mats[idx] = mat; lvls[idx] = lv;
+}
+
+function drawConfetti(tau) {
+  const k = 1.3, g = 4.2, ek = (1 - Math.exp(-k * tau)) / k;     // air drag: it floats and flutters down
+  for (const c of confetti) {
+    const fade = clamp01((tau - 2.3 - c.j * 0.9) / 0.8);
+    if (fade >= 1) continue;
+    const flut = Math.sin(tau * 3 + c.j * 9) * 0.06 * tau;
+    let x = c.p0[0] + c.v[0] * ek + flut, z = c.p0[2] + c.v[2] * ek + Math.cos(tau * 2.6 + c.j * 7) * 0.05 * tau;
+    let y = c.p0[1] + (c.v[1] + g / k) * ek - (g * tau) / k;
+    if (y < GROUND + 0.015) y = GROUND + 0.015;
+    const ch = fade > 0.6 ? "." : ((tau * c.spin + c.j * 10) | 0) % 2 ? c.g1 : c.g2;
+    emitChar(x, y, z, ch, c.mat, Math.round(lerp(LV - 1, 1, fade)));
+  }
+}
+
+/* ---------- PUZZLE WRAP ----------
+   The bouquet's paper cone is cut into 6 x 3 jigsaw pieces (with interlocking tabs).
+   Each piece flies in tumbling, snaps into place with a gold flash, bottom row first;
+   then the ribbon + bow drop on top. Faint seams stay as a little reminder. */
+function rng(seed) {                 // small seeded random, so the puzzle cut is the same every time
+  return () => {
+    seed |= 0; seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const PZ_A = 6, PZ_H = 3, PZ_N = PZ_A * PZ_H;
+const WRAP_APEX = -1.05, WRAP_TOP = -0.3, WRAP_R = 0.48;
+let pzId = null, pzBorder = null, pzPieces = null, tabV = null, tabH = null;
+
+// which jigsaw piece owns cone point (phi, h)?  tabs are little knobs poking across each edge
+function pieceOf(phi, h) {
+  const a = (phi / (2 * Math.PI)) * PZ_A, b = Math.min(PZ_H - 1e-6, Math.max(0, h * PZ_H));
+  const i = Math.floor(a) % PZ_A, j = Math.floor(b), fu = a - Math.floor(a), fv = b - j;
+  const R = 0.21, C = 0.17, inC = (cx, cy) => (fu - cx) ** 2 + (fv - cy) ** 2 < R * R;
+  const iL = (i + PZ_A - 1) % PZ_A, iR = (i + 1) % PZ_A;
+  if (tabV[i][j] < 0 && inC(1 - C, 0.5)) return j * PZ_A + iR;                    // right neighbour's knob
+  if (tabV[iL][j] > 0 && inC(C, 0.5)) return j * PZ_A + iL;                       // left neighbour's knob
+  if (j < PZ_H - 1 && tabH[i][j] < 0 && inC(0.5, 1 - C)) return (j + 1) * PZ_A + i; // upper neighbour's knob
+  if (j > 0 && tabH[i][j - 1] > 0 && inC(0.5, C)) return (j - 1) * PZ_A + i;        // lower neighbour's knob
+  return j * PZ_A + i;
+}
+
+function buildPuzzle() {
+  const r = rng(77);
+  tabV = Array.from({ length: PZ_A }, () => Array.from({ length: PZ_H }, () => (r() < 0.5 ? 1 : -1)));
+  tabH = Array.from({ length: PZ_A }, () => Array.from({ length: PZ_H }, () => (r() < 0.5 ? 1 : -1)));
+  const n = wrapCache.length / 8;
+  pzId = new Int16Array(n); pzBorder = new Uint8Array(n);
+  const sum = Array.from({ length: PZ_N }, () => [0, 0, 0, 0]);
+  const dA = ((2 * Math.PI) / PZ_A) * 0.05, dH = (1 / PZ_H) * 0.06;
+  for (let q = 0; q < n; q++) {
+    const i = q * 8, x = wrapCache[i], y = wrapCache[i + 1], z = wrapCache[i + 2];
+    if (wrapCache[i + 6] !== M.paper) { pzId[q] = -1; continue; }                 // ribbon + bow
+    const phi = (Math.atan2(z, x) + 2 * Math.PI) % (2 * Math.PI), h = Math.hypot(x, z) / WRAP_R;
+    const id = pieceOf(phi, h);
+    pzId[q] = id;
+    const wrapA = t => (t + 2 * Math.PI) % (2 * Math.PI);
+    pzBorder[q] = pieceOf(wrapA(phi + dA), h) !== id || pieceOf(wrapA(phi - dA), h) !== id ||
+                  (h + dH < 1 && pieceOf(phi, h + dH) !== id) || (h - dH > 0.02 && pieceOf(phi, h - dH) !== id) ? 1 : 0;
+    const sm = sum[id]; sm[0] += x; sm[1] += y; sm[2] += z; sm[3]++;
+  }
+  // landing order: bottom row first, going round the cone from the front
+  const order = [];
+  for (let j = 0; j < PZ_H; j++) for (let k = 0; k < PZ_A; k++) order.push(j * PZ_A + ((k * 5 + 1) % PZ_A));
+  pzPieces = sum.map((sm, id) => {
+    const c = sm[3] ? [sm[0] / sm[3], sm[1] / sm[3], sm[2] / sm[3]] : [0, 0, 0];
+    const out = norm(c[0] || 0.01, 0, c[2] || 0.01), far = 1.3 + r() * 0.7;
+    return {
+      c, off: [out[0] * far + (r() - 0.5) * 0.6, 0.5 + r() * 0.9, out[2] * far + (r() - 0.5) * 0.6],
+      axis: norm(r() - 0.5, r() - 0.5, r() - 0.5), spin: (r() < 0.5 ? -1 : 1) * (2.5 + r() * 2.5),
+      t0: T_HOME + order.indexOf(id) * PZ_STAGGER, landed: false,
+    };
+  });
+}
+
+const easeOutBack = x => { const c1 = 1.5, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+
+function drawPuzzleWrap(tt, T) {
+  // per-piece transform for this frame
+  const st = pzPieces.map(P => {
+    const p = clamp01((tt - P.t0) / PZ_FLY);
+    if (p <= 0) return null;
+    const e = easeOutBack(p), ang = P.spin * (1 - easeOut(p));
+    const c = Math.cos(ang), s = Math.sin(ang), t = 1 - c, [kx, ky, kz] = P.axis;
+    if (p >= 1 && !P.landed) {                         // click! sparkle where it locked in
+      P.landed = tt;
+      const [px, py] = project(P.c[0], P.c[1], P.c[2]);
+      for (let q = 0; q < 4; q++) addSparkle(px + (Math.random() - 0.5) * 8, py + (Math.random() - 0.5) * 4, T, 0.6);
+    }
+    return {
+      R: [t * kx * kx + c, t * kx * ky - s * kz, t * kx * kz + s * ky,
+          t * kx * ky + s * kz, t * ky * ky + c, t * ky * kz - s * kx,
+          t * kx * kz - s * ky, t * ky * kz + s * kx, t * kz * kz + c],
+      o: [P.off[0] * (1 - e), P.off[1] * (1 - e), P.off[2] * (1 - e)],
+      flash: P.landed ? Math.max(0, 1 - (tt - P.landed) / 0.6) : 1, c: P.c,
+    };
+  });
+  const bowQ = clamp01((tt - T_BOWDROP) / 0.55), bowY = (1 - bounceOut(bowQ)) * 0.8;
+  const ga = (T * 1.4) % (Math.PI * 2) - Math.PI, wc = wrapCache;
+  for (let q = 0, i = 0; i < wc.length; q++, i += 8) {
+    const id = pzId[q];
+    let x = wc[i], y = wc[i + 1], z = wc[i + 2], nx = wc[i + 3], ny = wc[i + 4], nz = wc[i + 5], mat = wc[i + 6], mul = wc[i + 7];
+    if (id < 0) {                                       // ribbon + bow: drop in, then a gleam runs around
+      if (bowQ <= 0) continue;
+      y += bowY;
+      let d = Math.atan2(z, x) - ga; d -= Math.round(d / (2 * Math.PI)) * 2 * Math.PI;
+      const gl = Math.exp(-(d * d) / 0.05);
+      if (gl > 0.05) { mul += gl * 0.9; if (gl > 0.6) mat = M.flash; }
+      emit(x, y, z, nx, ny, nz, mat, mul);
+      continue;
+    }
+    const S = st[id];
+    if (!S) continue;
+    const R = S.R, dx = x - S.c[0], dy = y - S.c[1], dz = z - S.c[2];
+    x = S.c[0] + R[0] * dx + R[1] * dy + R[2] * dz + S.o[0];
+    y = S.c[1] + R[3] * dx + R[4] * dy + R[5] * dz + S.o[1];
+    z = S.c[2] + R[6] * dx + R[7] * dy + R[8] * dz + S.o[2];
+    const mx = R[0] * nx + R[1] * ny + R[2] * nz, my = R[3] * nx + R[4] * ny + R[5] * nz, mz = R[6] * nx + R[7] * ny + R[8] * nz;
+    if (pzBorder[q]) {                                  // the jigsaw cut lines: glowing while flying, then thin gold seams
+      if (S.flash > 0.5) { mat = M.flash; mul = 1.1 + (S.flash - 0.5) * 0.6; }
+      else { mat = M.gold; mul = 0.62 + S.flash * 0.8; }
+    }
+    emit(x, y, z, mx, my, mz, mat, mul);
+  }
+}
+
+// ---------- the bouquet (unchanged recipe, now on its own clock Tb) ----------
+function drawBouquet(Tb, T) {
+  for (const f of flowers) {
+    const lt = Tb - f.delay;
+    if (lt < 0) continue;
+    const g = easeOut(lt / GROW);
+    const b = smooth((lt - GROW) / BLOOM);
+
+    const sw = [Math.sin(T * 0.9 + f.ph), 0, Math.cos(T * 0.7 + f.ph)];       // gentle sway
+    const B = [f.B0[0] + sw[0] * 0.015, f.B0[1], f.B0[2] + sw[2] * 0.015];
+    const ctrl = [B[0] * 0.15, (GATHER[1] + B[1]) / 2, B[2] * 0.15];
+
+    stem(GATHER, ctrl, B, g);
+
+    if (f.type !== "breath") {                                                 // leaves unfurl
+      const lg = clamp01((g - 0.6) / 0.4);
+      if (lg > 0) {
+        const S = bez(GATHER, ctrl, B, 0.6);
+        let out = [S[0], 0, S[2]];
+        if (Math.hypot(out[0], out[2]) < 0.02) out = [Math.cos(f.rot), 0, Math.sin(f.rot)];
+        const D = norm(out[0] * f.leafSide, 0.7, out[2] * f.leafSide);
+        const side = norm(...cross(D, [0, 1, 0]));
+        surface(null, leafFn, { S, D, side, N: cross(D, side), len: 0.17 * lg, wid: 0.04 }, 10, 4, M.leaf, false);
+      }
+    }
+
+    if (g >= 1) {
+      const a = norm(f.a0[0] + sw[0] * 0.06, f.a0[1], f.a0[2] + sw[2] * 0.06);
+      const ref = Math.abs(a[1]) < 0.95 ? [0, 1, 0] : [1, 0, 0];
+      const e1 = norm(...cross(ref, a)), e2 = cross(a, e1);
+      const F = { B, a, e1, e2, s: SIZE[f.type] * (0.3 + 0.7 * smooth(b * 1.6)), rot: f.rot, mat: f.mat, type: f.type };
+      FLASH = f.flashT ? Math.max(0, 1 - (T - f.flashT) / 0.75) : 0;
+      if (b >= 1) {
+        if (!f.cache) { REC = []; FLOWER[f.type](F, 1); f.cache = Float32Array.from(REC); REC = null; }
+        const c = f.cache;
+        for (let i = 0; i < c.length; i += 8) emitLocal(F, c[i], c[i+1], c[i+2], c[i+3], c[i+4], c[i+5], c[i+6], c[i+7]);
+      } else {
+        DEN_MUL = PORTRAIT ? 0.55 : 0.7; FLOWER[f.type](F, b); DEN_MUL = 1;
+      }
+      FLASH = 0;
+      if (b >= 1 && PETAL_FALL[f.type] && Math.random() < 0.012) {
+        petals.push({ p: [B[0] + a[0] * 0.12 + (Math.random() - 0.5) * 0.15, B[1] + a[1] * 0.12, B[2] + a[2] * 0.12 + (Math.random() - 0.5) * 0.15],
+                      ph: Math.random() * 6, mat: f.mat === M.red && f.type !== "rose" ? M.white : f.mat, born: T,
+                      vy: 0.16 + Math.random() * 0.12 });
+      }
+      if (b > 0.97 && !f.burst) {
+        f.burst = true; f.flashT = T;
+        const [px, py] = project(B[0] + a[0] * 0.1, B[1] + a[1] * 0.1, B[2] + a[2] * 0.1);
+        for (let k = 0; k < 7; k++) {
+          const ang = (k / 7) * Math.PI * 2 + Math.random();
+          addSparkle(px + Math.cos(ang) * 7, py + Math.sin(ang) * 4, T, 0.8);
+        }
+      }
+    }
+  }
+}
+
+// ---------- falling petals (3D, depth-tested) ----------
+const PETAL_FALL = { rose: 1, tulip: 1, daisy: 1, lily: 1, sunflower: 1 };
+let petals = [];
+const PETAL_GLYPHS = [",", "`", "'", ".", ","];
+function drawPetals(T, dt) {
+  for (const pt of petals) {
+    pt.p[1] -= pt.vy * dt;
+    pt.p[0] += Math.sin(T * 1.7 + pt.ph) * 0.12 * dt;
+    pt.p[2] += Math.cos(T * 1.3 + pt.ph) * 0.08 * dt;
+    if (pt.p[1] < GROUND + 0.012) pt.p[1] = GROUND + 0.012;            // rest on the opened box
+    const g = PETAL_GLYPHS[((T * 5 + pt.ph) | 0) % PETAL_GLYPHS.length];
+    emitChar(pt.p[0], pt.p[1], pt.p[2], g, pt.mat, LV - 2);
+  }
+  petals = petals.filter(pt => T - pt.born < 9);
+}
+
+// ---------- night sky: twinkling stars + cross-shaped flares ----------
+let stars = [], flares = [], glints = [];
+function buildStars() {
+  stars = [];
+  const n = Math.round((W * H) / 42);
+  for (let i = 0; i < n; i++)
+    stars.push({ x: (Math.random() * W) | 0, y: (Math.random() * H) | 0, ph: Math.random() * 6.3,
+                 sp: 0.6 + Math.random() * 2.2, b: Math.random() });
+}
+const STAR_C = ["rgba(200,200,255,0.35)", "rgba(225,225,255,0.6)", "rgba(255,255,255,0.9)"];
+function drawSky(T) {
+  ctx.font = `${fs}px ${FONT}`;
+  for (const st of stars) {
+    if (st.y < SCENE_H && zbuf[st.y * W + st.x] > 0) continue;
+    const tw = 0.5 + 0.5 * Math.sin(st.ph + T * st.sp);
+    const v = st.b * 0.6 + tw * 0.4;
+    if (v < 0.25) continue;
+    ctx.fillStyle = STAR_C[v > 0.8 ? 2 : v > 0.5 ? 1 : 0];
+    ctx.fillText(v > 0.88 ? "+" : v > 0.6 ? "*" : ".", st.x * cw, st.y * lh);
+  }
+  // flares: a bright centre with arms that grow then shrink
+  if (Math.random() < 0.05) flares.push({ x: (Math.random() * W) | 0, y: (Math.random() * H * 0.9) | 0, born: T, life: 1.1 + Math.random() * 0.8,
+                                         c: Math.random() < 0.3 ? "255,214,240" : Math.random() < 0.5 ? "201,231,255" : "255,246,176" });
+  flares = flares.filter(f => T - f.born < f.life);
+  for (const f of flares) {
+    const k = Math.sin((Math.PI * (T - f.born)) / f.life), arm = Math.round(k * 4), armY = Math.round(k * 2);
+    const put = (dx, dy, ch, a) => {
+      const x = f.x + dx, y = f.y + dy;
+      if (x < 0 || y < 0 || x >= W || y >= H || (y < SCENE_H && zbuf[y * W + x] > 0)) return;
+      ctx.fillStyle = `rgba(${f.c},${(a * k).toFixed(2)})`; ctx.fillText(ch, x * cw, y * lh);
+    };
+    put(0, 0, "*", 1);
+    for (let d = 1; d <= arm; d++) { const a = 1 - d / (arm + 1); put(d, 0, "-", a); put(-d, 0, "-", a); }
+    for (let d = 1; d <= armY; d++) { const a = 1 - d / (armY + 1); put(0, d, "|", a); put(0, -d, "|", a); }
+    if (arm >= 3) { put(1, 1, "\\", 0.4); put(-1, -1, "\\", 0.4); put(1, -1, "/", 0.4); put(-1, 1, "/", 0.4); }
+  }
+}
+
+// ---------- dew glints: brief white sparkles on bright petals ----------
+const GLINT_MATS = new Set([M.red, M.pink, M.tulipPink, M.tulipYellow, M.white, M.lilyWhite, M.lilyPink, M.sunPetal]);
+function drawGlints(T, active) {
+  if (active) for (let k = 0; k < 4; k++) {
+    const i = (Math.random() * W * SCENE_H) | 0;
+    if (zbuf[i] > 0 && GLINT_MATS.has(mats[i]) && lvls[i] >= LV - 5 && Math.random() < 0.5) glints.push({ i, born: T });
+  }
+  glints = glints.filter(g => T - g.born < 0.5);
+  for (const g of glints) {
+    const a = (T - g.born) / 0.5, ch = a < 0.3 ? "+" : a < 0.6 ? "*" : "+";
+    ctx.fillStyle = `rgba(255,255,255,${(1 - Math.abs(a - 0.45) * 1.5).toFixed(2)})`;
+    ctx.fillText(ch, (g.i % W) * cw, ((g.i / W) | 0) * lh);
+  }
+}
+
+// ---------- state ----------
+let opened = false, tapT = 0, yawAtTap = 0, confettiOut = false, done = false;
+let lastFrameT = 0;
+const idleYaw = T => 0.55 * Math.sin(T * 0.7);
+const bqTime = T => (opened ? T - tapT - T_BOUQUET : -1);
+
+function setCamera(T) {
+  let pitch, zoom, yc, yaw;
+  if (!opened) {
+    ({ pitch, zoom, yc } = CAM.box); yaw = idleYaw(T);
+  } else {
+    const tt = T - tapT;
+    const eN = smooth((tt - T_EXPLODE) / 0.9), eB = smooth((tt - T_HOME + 0.2) / (T_WRAP + 0.4 - T_HOME));
+    const k = key => lerp(lerp(CAM.box[key], CAM.net[key], eN), CAM.bq[key], eB);
+    pitch = k("pitch"); zoom = k("zoom"); yc = k("yc");
+    const tb = tt - T_BOUQUET, ramp = smooth(tb / 3);
+    yaw = yawAtTap * (1 - smooth(tt / 0.6)) + ramp * (ROCK * Math.sin(tb * 0.45) + 0.15 * Math.sin(tb * 0.17));
+  }
+  cyw = Math.cos(yaw); syw = Math.sin(yaw); cp = Math.cos(pitch); sp = Math.sin(pitch);
+  KXz = KX * zoom; KYz = KY * zoom; YCv = yc;
+}
+
+// ---------- one frame ----------
+function computeFrame(T) {
+  chars.fill(" "); zbuf.fill(0);
+  setCamera(T);
+  if (!wrapCache) { RECW = []; wrap(); wrapCache = Float32Array.from(RECW); RECW = null; }
+
+  const tt = opened ? T - tapT : -1;
+  const hop = opened ? 0 : 0.07 * Math.pow(Math.max(0, Math.sin(T * 2.2)), 8);  // little "pick me" hop
+  const tau = tt - T_EXPLODE;
+
+  // box / net
+  const theta = tau > 0 ? (Math.PI / 2) * bounceOut(clamp01(tau / 0.75)) : 0;
+  const netDim = lerp(0.95, 0.62, smooth((tt - T_WRAP) / 1.5));
+  drawWalls(theta, hop, netDim);
+  if (theta > 0.02) drawFloor(netDim);
+  drawLid(tau, hop);
+
+  // the wrap is built from jigsaw pieces, then the flowers grow
+  if (!pzId || pzId.length !== wrapCache.length / 8) buildPuzzle();
+  if (opened && tt > T_HOME) drawPuzzleWrap(tt, T);
+  const Tb = bqTime(T);
+  if (Tb > 0) drawBouquet(Tb, T);
+
+  // the ribbon is drawn after the outline pass while it is a thin flying line
+  const ribbonLate = opened && tt > T_UNRAVEL;
+  if (!ribbonLate) drawRibbon(tt, hop);
+  outline();
+  if (ribbonLate) drawRibbon(tt, hop);
+
+  const dt = Math.min(0.1, Math.max(0, T - lastFrameT)); lastFrameT = T;
+  if (Tb > 0) drawPetals(T, dt);
+
+  // confetti
+  if (opened && tau > 0) {
+    if (!confettiOut) { confettiOut = true; spawnConfetti(); }
+    if (tau < 4.2) drawConfetti(tau);
+  }
+
+  // background twinkles
+
+  sparkles = sparkles.filter(s => T - s.born < s.life);
+}
+
+function drawFrame(T) {
+  const cssW = W * cw, cssH = H * lh;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // fading trails: erase most (not all) of the previous frame
+  ctx.globalCompositeOperation = "destination-out";
+  ctx.fillStyle = `rgba(0,0,0,${1 - TRAIL})`;
+  ctx.fillRect(0, 0, cssW, cssH);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.textBaseline = "top";
+  drawSky(T);
+  ctx.font = `${fs}px ${FONT}`;
+
+  // batch runs of same-coloured characters into one fillText call (much faster on phones)
+  for (let y = 0; y < SCENE_H; y++) {
+    let run = "", runC = null, runX = 0;
+    for (let x = 0; x <= W; x++) {
+      const i = y * W + x;
+      const ch = x < W ? chars[i] : " ";
+      const col = ch === " " ? null : PAL[mats[i]][lvls[i]];
+      if (col !== runC) {
+        if (runC) { ctx.fillStyle = runC; ctx.fillText(run, runX * cw, y * lh); }
+        run = ""; runC = col; runX = x;
+      }
+      if (col) run += ch;
+    }
+  }
+  for (const s of sparkles) {
+    if (s.x < 0 || s.y < 0 || s.x >= W || s.y >= SCENE_H || zbuf[s.y * W + s.x] > 0) continue;
+    const k = Math.min(SPARK.length - 1, Math.floor(((T - s.born) / s.life) * SPARK.length));
+    ctx.fillStyle = s.c;
+    ctx.fillText(SPARK[k], s.x * cw, s.y * lh);
+  }
+
+  drawGlints(T, bqTime(T) > 3);
+
+  // birthday message: drawn big in screen pixels so it's readable on a phone
+  const Tb = bqTime(T);
+  if (Tb > TEXT_START) {
+    const n = Math.min(MESSAGE.length, Math.floor((Tb - TEXT_START) / 0.07));
+    const fsz = Math.min(PORTRAIT ? 34 : 44, (cssW * 0.86) / ((MESSAGE.length + 2) * CH_RATIO));
+    const step = fsz * CH_RATIO, x0 = (cssW - (MESSAGE.length + 2) * step) / 2;
+    const y = cssH * (PORTRAIT ? 0.85 : 0.88);
+    ctx.font = `bold ${fsz}px ${FONT}`;
+    ctx.shadowColor = "rgba(5,3,15,0.95)"; ctx.shadowBlur = fsz * 0.5;
+    for (let i = 0; i < n; i++) {
+      ctx.fillStyle = `hsl(${(i * 22 + T * 90) % 360},95%,72%)`;
+      ctx.fillText(MESSAGE[i], x0 + i * step, y);
+    }
+    if (n === MESSAGE.length) {                  // twinkling gold star
+      const ph = ((Tb - TEXT_START) * 1.15) % 1;
+      const beat = Math.exp(-(((ph - 0.08) / 0.05) ** 2)) + 0.65 * Math.exp(-(((ph - 0.28) / 0.05) ** 2));
+      const hs = fsz * (1 + 0.3 * beat);
+      ctx.font = `bold ${hs}px ${FONT}`;
+      ctx.fillStyle = `hsl(48,100%,${(62 + 18 * beat).toFixed(0)}%)`;
+      ctx.shadowColor = "rgba(255,210,80,0.95)"; ctx.shadowBlur = 10 + 18 * beat;
+      ctx.fillText("\u2605", x0 + (MESSAGE.length + 0.8) * step - (hs - fsz) * 0.3, y - (hs - fsz) * 0.5);
+    }
+    ctx.shadowBlur = 0;
+    if (n === MESSAGE.length && !done) { done = true; hint.textContent = "tap to replay"; hint.style.opacity = 1; }
+  }
+}
+
+function drawGlow() {
+  if (!GLOW_ON) return;
+  for (const g of glows) {
+    g.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    g.ctx.clearRect(0, 0, g.el.width, g.el.height);
+    g.ctx.drawImage(cvs, 0, 0, g.el.width, g.el.height);
+  }
+}
+
+// ---------- loop + input ----------
+let start = performance.now(), lastRender = 0, nowT = 0;
+function loop(now) {
+  requestAnimationFrame(loop);
+  if (now - lastRender < 33) return;      // ~30 fps
+  lastRender = now;
+  nowT = (now - start) / 1000;
+  const t0 = performance.now();
+  computeFrame(nowT);
+  drawFrame(nowT);
+  drawGlow();
+  // if this device is struggling, drop the glow layers (everything else stays)
+  const ms = performance.now() - t0;
+  slowAvg = slowAvg * 0.95 + ms * 0.05;
+  if (GLOW_ON && nowT > 4 && slowAvg > 65) { GLOW_ON = false; glows.forEach(g => (g.el.style.display = "none")); }
+}
+let slowAvg = 0;
+
+function openGift(T) {
+  opened = true; tapT = T; yawAtTap = idleYaw(T); confettiOut = false; done = false;
+  if (pzPieces) pzPieces.forEach(P => (P.landed = false));
+  hint.style.opacity = 0;
+}
+function resetGift() {
+  opened = false; confetti = []; confettiOut = false; done = false; sparkles = []; petals = []; glints = [];
+  flowers.forEach(f => { f.burst = false; f.flashT = 0; });
+  hint.textContent = "tap the gift to open"; hint.style.opacity = 1;
+}
+function onTap(e) {
+  e.preventDefault();
+  if (!opened) openGift(nowT);
+  else if (done) resetGift();
+}
+
+addEventListener("resize", fit);
+addEventListener("pointerdown", onTap, { passive: false });
+fit();
+setTimeout(() => { if (!opened) hint.style.opacity = 1; }, 900);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
